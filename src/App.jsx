@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useCallback } from "react";
-import { supabase } from "./lib/supabase";
+import React, { useState, useEffect, useCallback, useRef } from "react";
+import { supabase, fetchSensorData, subscribeToSensorData } from "./lib/supabase";
 import {
   Leaf,
   Droplet,
@@ -50,6 +50,9 @@ const formatTime = (ts) => {
   const d = new Date(ts);
   return d.toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit" });
 };
+
+// Polling interval in ms (10 seconds for responsive sync)
+const POLL_INTERVAL_MS = 10_000;
 
 // ----------------------------------------------------------------------
 // Custom Components
@@ -118,70 +121,86 @@ export default function App() {
   const [chartData, setChartData] = useState(fallbackChartData);
   const [historyData, setHistoryData] = useState(fallbackHistoryData);
   const [latestData, setLatestData] = useState({ ph: 7.2, od: 14.5, co2: 450 });
-  const [isConnected, setIsConnected] = useState(false);
+  const [lastUpdated, setLastUpdated] = useState(null);
+  const channelRef = useRef(null);
+  const isMountedRef = useRef(true);
 
-  // Fetch data from Supabase
-  const fetchData = useCallback(async () => {
-    try {
-      // Fetch last 50 readings for chart (ordered oldest → newest)
-      const { data: chartRows, error: chartErr } = await supabase
-        .from("sensor_data")
-        .select("*")
-        .order("created_at", { ascending: false })
-        .limit(50);
+  // ----- helpers to process rows from Supabase -----
+  const processRows = useCallback((rows) => {
+    if (!rows || rows.length === 0) return;
 
-      if (chartErr) throw chartErr;
+    // rows are newest-first from the API
+    const reversed = [...rows].reverse();
+    setChartData(reversed.map(r => ({
+      time: formatTime(r.created_at),
+      ph: r.ph,
+      od: r.turbidity,
+      co2: r.co2,
+    })));
 
-      if (chartRows && chartRows.length > 0) {
-        setIsConnected(true);
-        const reversed = [...chartRows].reverse();
-        setChartData(reversed.map(r => ({
-          time: formatTime(r.created_at),
-          ph: r.ph,
-          od: r.turbidity,
-          co2: r.co2,
-        })));
+    // Latest reading = most recent row (first in the original order)
+    const latest = rows[0];
+    setLatestData({ ph: latest.ph, od: latest.turbidity, co2: latest.co2 });
+    setCo2Level(Math.round(latest.co2));
+    setLastUpdated(new Date(latest.created_at));
 
-        // Latest reading = most recent row
-        const latest = chartRows[0];
-        setLatestData({ ph: latest.ph, od: latest.turbidity, co2: latest.co2 });
-        setCo2Level(Math.round(latest.co2));
-
-        // History table = last 10
-        setHistoryData(chartRows.slice(0, 10).map((r, i) => ({
-          id: r.id,
-          time: formatTime(r.created_at),
-          ph: r.ph,
-          od: r.turbidity,
-          co2: r.co2,
-        })));
-      }
-    } catch (err) {
-      console.warn("Supabase fetch error (using fallback data):", err.message);
-    }
+    // History table = last 10
+    setHistoryData(rows.slice(0, 10).map((r) => ({
+      id: r.id,
+      time: formatTime(r.created_at),
+      ph: r.ph,
+      od: r.turbidity,
+      co2: r.co2,
+    })));
   }, []);
 
-  // Initial fetch + Realtime subscription
+  // ----- Fetch data from Supabase -----
+  const fetchData = useCallback(async () => {
+    const { rows, error } = await fetchSensorData(50);
+
+    if (error) {
+      console.error("[ALPHA-C] fetchData error:", error);
+      return;
+    }
+
+    if (isMountedRef.current && rows.length > 0) {
+      processRows(rows);
+    }
+  }, [processRows]);
+
+  // ----- Initial setup: fetch + realtime subscribe -----
   useEffect(() => {
+    isMountedRef.current = true;
+
+    // 1) Fetch existing sensor data immediately
     fetchData();
 
-    const channel = supabase
-      .channel("sensor_realtime")
-      .on("postgres_changes", { event: "INSERT", schema: "public", table: "sensor_data" }, (payload) => {
-        const row = payload.new;
+    // 2) Subscribe to realtime inserts — data appears instantly when IoT pushes to Supabase
+    const channel = subscribeToSensorData({
+      onInsert: (row) => {
+        if (!isMountedRef.current) return;
         const newPoint = { time: formatTime(row.created_at), ph: row.ph, od: row.turbidity, co2: row.co2 };
 
+        setLastUpdated(new Date(row.created_at));
         setChartData(prev => [...prev.slice(-49), newPoint]);
         setLatestData({ ph: row.ph, od: row.turbidity, co2: row.co2 });
         setCo2Level(Math.round(row.co2));
         setHistoryData(prev => [{ id: row.id, ...newPoint }, ...prev.slice(0, 9)]);
-      })
-      .subscribe();
+      },
+      onStatusChange: (status, err) => {
+        if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+          console.error("[ALPHA-C] Realtime error:", status, err);
+        }
+      },
+    });
 
-    // Refresh every 60s as backup
-    const interval = setInterval(fetchData, 60000);
+    channelRef.current = channel;
+
+    // 3) Poll every POLL_INTERVAL_MS as a backup (in case realtime drops)
+    const interval = setInterval(fetchData, POLL_INTERVAL_MS);
 
     return () => {
+      isMountedRef.current = false;
       supabase.removeChannel(channel);
       clearInterval(interval);
     };
@@ -301,20 +320,6 @@ export default function App() {
               >
                 {isDarkMode ? <Sun className="w-5 h-5" /> : <Moon className="w-5 h-5" />}
               </button>
-
-              <GlassCard className="!rounded-full px-6 py-3 border-emerald-500/20 shadow-[0_0_15px_rgba(16,185,129,0.1)] dark:shadow-[0_0_20px_rgba(16,185,129,0.15)]">
-                <div className="flex items-center">
-                  <div className="relative flex h-3 w-3 mr-4">
-                    {/* Ripple Effect */}
-                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-100"></span>
-                    <span className="absolute -inset-1 rounded-full border border-emerald-400 animate-ping opacity-50" style={{ animationDelay: '0.2s' }}></span>
-                    <span className="relative inline-flex rounded-full h-3 w-3 bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.8)]"></span>
-                  </div>
-                  <span className="text-sm font-bold tracking-widest text-emerald-700 dark:text-emerald-100 uppercase drop-shadow-sm dark:drop-shadow-[0_0_8px_rgba(16,185,129,0.5)]">
-                    Live System: <span className={isConnected ? "text-emerald-600 dark:text-emerald-400" : "text-amber-600 dark:text-amber-400"}>{isConnected ? "ONLINE" : "OFFLINE"}</span>
-                  </span>
-                </div>
-              </GlassCard>
             </div>
           </header>
 
@@ -387,7 +392,7 @@ export default function App() {
             <GlassCard className="p-6 flex flex-col justify-between group/aerator relative">
               {/* Ambient inner glow when ON */}
               {isAeratorOn && (
-                <div className="absolute inset-0 bg-cyan-300/20 dark:bg-cyan-500/5 mix-blend-multiply dark:mix-blend-screen pointer-events-none transition-opacity duration-1000"></div>
+                <div className="absolute inset-0 bg-cyan-300/20 dark:bg-cyan-500/5 mix-blend-multiply dark:mix-blend-screen pointer-events-none transition-opacity duration-1000 rounded-3xl"></div>
               )}
               
               <div className="flex justify-between items-start mb-4 relative z-10">
@@ -400,21 +405,13 @@ export default function App() {
                 
                 <button 
                   onClick={() => setIsAeratorOn(!isAeratorOn)}
-                  className={`p-4 rounded-2xl transition-all duration-300 border backdrop-blur-md relative overflow-hidden
+                  className={`p-3 rounded-2xl transition-all duration-300 border backdrop-blur-md relative
                     ${isAeratorOn 
                       ? 'bg-cyan-50 dark:bg-cyan-500/10 border-cyan-200 dark:border-cyan-500/30 text-cyan-600 dark:text-cyan-400 shadow-md dark:shadow-[0_0_20px_rgba(34,211,238,0.3)]' 
                       : 'bg-slate-100 dark:bg-slate-800/50 border-slate-200 dark:border-slate-700 text-slate-400 dark:text-slate-500 hover:bg-slate-200 dark:hover:bg-slate-700'}
                   `}
                 >
-                  {/* Motion Blur Effect for Fan */}
-                  <div className="relative">
-                    {isAeratorOn && (
-                      <div className="absolute inset-0 blur-sm opacity-50">
-                         <Fan className="w-8 h-8 animate-spin" style={{ animationDuration: '0.2s' }} />
-                      </div>
-                    )}
-                    <Fan className={`w-8 h-8 relative z-10 ${isAeratorOn ? 'animate-spin' : ''}`} style={{ animationDuration: isAeratorOn ? '0.5s' : '0s' }} />
-                  </div>
+                  <Fan className={`w-6 h-6 ${isAeratorOn ? 'animate-spin' : ''}`} style={{ animationDuration: isAeratorOn ? '0.6s' : '0s' }} />
                 </button>
               </div>
               
