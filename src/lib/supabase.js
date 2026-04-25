@@ -3,6 +3,9 @@ import { createClient } from '@supabase/supabase-js'
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL
 const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY
 
+// The actual IoT data table in Supabase
+const TABLE_NAME = 'alpha-c'
+
 // Validate that environment variables are set
 if (!supabaseUrl || !supabaseAnonKey) {
   console.error(
@@ -18,7 +21,6 @@ export const supabase = createClient(supabaseUrl || '', supabaseAnonKey || '', {
       eventsPerSecond: 10,
     },
   },
-  // Ensure we handle reconnections gracefully
   auth: {
     persistSession: true,
     autoRefreshToken: true,
@@ -26,41 +28,13 @@ export const supabase = createClient(supabaseUrl || '', supabaseAnonKey || '', {
 })
 
 /**
- * Test if we can actually reach Supabase and query the sensor_data table.
- * Returns { connected: boolean, hasData: boolean, rowCount: number, error?: string }
- */
-export async function testConnection() {
-  try {
-    if (!supabaseUrl || !supabaseAnonKey) {
-      return { connected: false, hasData: false, rowCount: 0, error: 'Missing environment variables' }
-    }
-
-    const { data, error, count } = await supabase
-      .from('sensor_data')
-      .select('id', { count: 'exact', head: true })
-
-    if (error) {
-      console.error('[ALPHA-C] Connection test query error:', error.message)
-      return { connected: false, hasData: false, rowCount: 0, error: error.message }
-    }
-
-    const rowCount = count ?? 0
-    console.info(`[ALPHA-C] Connection test OK — ${rowCount} rows in sensor_data`)
-    return { connected: true, hasData: rowCount > 0, rowCount }
-  } catch (err) {
-    console.error('[ALPHA-C] Connection test exception:', err.message)
-    return { connected: false, hasData: false, rowCount: 0, error: err.message }
-  }
-}
-
-/**
- * Fetch the latest N rows from sensor_data (newest first).
+ * Fetch the latest N rows from the alpha-c table (newest first).
  * Returns { rows: array, error?: string }
  */
 export async function fetchSensorData(limit = 50) {
   try {
     const { data, error } = await supabase
-      .from('sensor_data')
+      .from(TABLE_NAME)
       .select('*')
       .order('created_at', { ascending: false })
       .limit(limit)
@@ -78,19 +52,19 @@ export async function fetchSensorData(limit = 50) {
 }
 
 /**
- * Subscribe to realtime INSERT events on sensor_data.
+ * Subscribe to realtime INSERT events on the alpha-c table.
  * Returns the channel so the caller can remove it on cleanup.
  */
 export function subscribeToSensorData({ onInsert, onStatusChange }) {
   const channel = supabase
-    .channel('sensor_realtime', {
+    .channel('alpha-c-realtime', {
       config: {
         broadcast: { self: true },
       },
     })
     .on(
       'postgres_changes',
-      { event: 'INSERT', schema: 'public', table: 'sensor_data' },
+      { event: 'INSERT', schema: 'public', table: TABLE_NAME },
       (payload) => {
         console.info('[ALPHA-C] Realtime INSERT received:', payload.new)
         onInsert?.(payload.new)

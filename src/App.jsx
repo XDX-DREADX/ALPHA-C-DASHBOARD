@@ -144,6 +144,11 @@ export default function App() {
     setCo2Level(Math.round(latest.co2));
     setLastUpdated(new Date(latest.created_at));
 
+    // Sync aerator status from IoT
+    if (latest.aerator_status !== undefined) {
+      setIsAeratorOn(latest.aerator_status === 'ON');
+    }
+
     // History table = last 10
     setHistoryData(rows.slice(0, 10).map((r) => ({
       id: r.id,
@@ -185,6 +190,9 @@ export default function App() {
         setChartData(prev => [...prev.slice(-49), newPoint]);
         setLatestData({ ph: row.ph, od: row.turbidity, co2: row.co2 });
         setCo2Level(Math.round(row.co2));
+        if (row.aerator_status !== undefined) {
+          setIsAeratorOn(row.aerator_status === 'ON');
+        }
         setHistoryData(prev => [{ id: row.id, ...newPoint }, ...prev.slice(0, 9)]);
       },
       onStatusChange: (status, err) => {
